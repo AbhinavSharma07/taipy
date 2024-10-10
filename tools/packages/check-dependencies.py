@@ -10,30 +10,43 @@
 # specific language governing permissions and limitations under the License.
 
 """
-This script is a helper on the dependencies management of the project.
-It can be used:
-- To check that the same version of a package is set across files.
-- To generate a Pipfile and requirements files with the latest version installables.
-- To display a summary of the dependencies to update.
+This script assists with dependency management for the project.
+It can be used to:
+- Ensure consistent package versions across multiple requirements files.
+- Generate Pipfile and requirements files with the latest installable versions.
+- Display a summary of dependencies that require updates.
 """
+
 import glob
 import itertools
+import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+import argparse
+import requests
 import tabulate
 import toml
+import re
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class Release:
     """
-    Information about a release of a package.
+    Information about a package release.
     """
-
     version: str
     upload_date: datetime.date
 
@@ -43,65 +56,55 @@ class Package:
     """
     Information about a package.
     """
-
-    # Package name
     name: str
-    # Min version of the package set as requirements.
-    min_version: str
-    # Max version of the package set as requirements.
-    max_version: str
-    # Setup installation markers of the package.
-    # ex: ;python_version>="3.6"
-    installation_markers: str
-    # Taipy dependencies are ignored.
-    is_taipy: bool
-    # Optional dependencies
-    extras_dependencies: List[str]
-    # Files where the package is set as requirement.
-    files: List[str]
-    # List of releases of the package.
+    min_version: str = ""
+    max_version: str = ""
+    installation_markers: str = ""
+    is_taipy: bool = False
+    extras_dependencies: List[str] = field(default_factory=list)
+    files: List[str] = field(default_factory=list)
     releases: List[Release] = field(default_factory=list)
-    # Min release of the package.
-    # Also present in the releases list.
-    min_release: Release = None
-    # Max release of the package.
-    # Also present in the releases list.
-    max_release: Release = None
-    # Latest version available on PyPI.
-    latest_release: Release = None
+    min_release: Optional[Release] = None
+    max_release: Optional[Release] = None
+    latest_release: Optional[Release] = None
 
     def __eq__(self, other):
-        return self.name == other.name
+        return isinstance(other, Package) and self.name == other.name
 
     def __hash__(self):
         return hash(self.name)
 
-    def load_releases(self):
+    def load_releases(self, session: requests.Session) -> None:
         """
         Retrieve all releases of the package from PyPI.
         """
-        import requests  # pylint: disable=import-outside-toplevel
+        try:
+            response = session.get(f"https://pypi.org/pypi/{self.name}/json", timeout=10)
+            response.raise_for_status()
+            releases_data = response.json().get("releases", {})
+        except requests.RequestException as e:
+            logger.error(f"Failed to fetch releases for package '{self.name}': {e}")
+            return
 
-        releases = requests.get(f"https://pypi.org/pypi/{self.name}/json", timeout=5).json().get("releases", {})
+        for version, info_list in releases_data.items():
+            # Skip if no release info or pre/post releases
+            if not info_list or any(re.search(r'[a-zA-Z]', c) for c in version):
+                continue
+            try:
+                upload_time = info_list[0]["upload_time"]
+                upload_date = datetime.strptime(upload_time, "%Y-%m-%dT%H:%M:%S").date()
+                release = Release(version=version, upload_date=upload_date)
+                self.releases.append(release)
 
-        for version, info in releases.items():
-            # Ignore old releases without upload time.
-            if not info:
-                continue
-            # Ignore pre and post releases.
-            if any(str.isalpha(c) for c in version):
-                continue
-            date = datetime.strptime(info[0]["upload_time"], "%Y-%m-%dT%H:%M:%S").date()
-            release = Release(version, date)
-            self.releases.append(release)
-            if self.min_version == version:
-                self.min_release = release
-            # Min and max version can be the same.
-            if self.max_version == version:
-                self.max_release = release
+                if self.min_version and self.min_version == version:
+                    self.min_release = release
+                if self.max_version and self.max_version == version:
+                    self.max_release = release
+            except (KeyError, ValueError) as e:
+                logger.warning(f"Skipping malformed release data for '{self.name}' version '{version}': {e}")
 
         self.releases.sort(key=lambda x: x.upload_date, reverse=True)
-        self.latest_release = self.releases[0]
+        self.latest_release = self.releases[0] if self.releases else None
 
     def as_requirements_line(self, with_version: bool = True) -> str:
         """
@@ -115,18 +118,18 @@ class Package:
             name += f'[{",".join(self.extras_dependencies)}]'
 
         if with_version:
+            version_spec = f">={self.min_version},<={self.max_version}"
             if self.installation_markers:
-                return f"{name}>={self.min_version},<={self.max_version};{self.installation_markers}"
-            return f"{name}>={self.min_version},<={self.max_version}"
+                return f"{name}{version_spec}; {self.installation_markers}"
+            return f"{name}{version_spec}"
 
         if self.installation_markers:
-            return f"{name};{self.installation_markers}"
+            return f"{name}; {self.installation_markers}"
         return name
 
     def as_pipfile_line(self) -> str:
         """
-        Return the package as a pipfile line.
-        If min_version is True, the min version is used.
+        Return the package as a Pipfile line.
         """
         line = f'"{self.name}" = {{version="=={self.max_version}"'
 
@@ -134,328 +137,357 @@ class Package:
             line += f', markers="{self.installation_markers}"'
 
         if self.extras_dependencies:
-            dep = ",".join(f'"{p}"' for p in self.extras_dependencies)
-            line += f", extras=[{dep}]"
+            extras = ", ".join(f'"{extra}"' for extra in self.extras_dependencies)
+            line += f", extras=[{extras}]"
 
         line += "}"
         return line
 
     @classmethod
-    def check_format(cls, package: str):
+    def from_requirements(cls, package_line: str, filename: str) -> 'Package':
         """
-        Check if a package definition is correctly formatted.
+        Create a Package instance from a requirements line.
         """
-        if ">=" not in package or "<" not in package:
-            # Only Taipy dependencies can be without version.
-            if "taipy" not in package:
-                raise Exception(f"Invalid package: {package}")
+        name, min_version, max_version, markers, extras = parse_requirements_line(package_line)
+        is_taipy = "taipy" in name.lower()
 
-    @classmethod
-    def from_requirements(cls, package: str, filename: str):
-        """
-        Create a package from a requirements line.
-        ex: "pandas>=1.0.0,<2.0.0;python_version<'3.9'"
-        """
-        try:
-            # Lower the name to avoid case issues.
-            name = extract_name(package).lower()
-            is_taipy = "taipy" in name
-            return cls(
-                name,
-                extract_min_version(package) if not is_taipy else "",
-                extract_max_version(package) if not is_taipy else "",
-                extract_installation_markers(package) if not is_taipy else "",
-                is_taipy,
-                extract_extras_dependencies(package),
-                [filename],
-            )
-        except Exception as e:
-            print(f"Error while parsing package {package}: {e}")  # noqa: T201
-            raise
+        return cls(
+            name=name.lower(),
+            min_version=min_version if not is_taipy else "",
+            max_version=max_version if not is_taipy else "",
+            installation_markers=markers if not is_taipy else "",
+            is_taipy=is_taipy,
+            extras_dependencies=extras,
+            files=[filename],
+        )
 
 
-def extract_installation_markers(package: str) -> str:
+def parse_requirements_line(package_line: str) -> (str, str, str, str, List[str]):
     """
-    Extract the installation markers of a package from a requirements line.
-    ex: "pandas>=1.0.0,<2.0.0;python_version<'3.9'" -> "python_version<'3.9'"
+    Parse a requirements line using regex to extract package details.
+
+    Returns:
+        Tuple containing:
+        - name (str)
+        - min_version (str)
+        - max_version (str)
+        - installation_markers (str)
+        - extras_dependencies (List[str])
     """
-    if ";" not in package:
-        return ""
-    return package.split(";")[1]
+    pattern = re.compile(
+        r"""^(?P<name>[A-Za-z0-9_\-]+)              # Package name
+            (?:\[(?P<extras>[A-Za-z0-9_,\-]+)\])?  # Optional extras
+            \s*
+            (?P<version_spec>(?:==|>=|<=|>|<)[^;]+)? # Version specifications
+            \s*
+            (?:;\s*(?P<markers>.+))?$               # Optional markers
+        """,
+        re.VERBOSE
+    )
+    match = pattern.match(package_line)
+    if not match:
+        raise ValueError(f"Invalid package format: '{package_line}'")
 
+    name = match.group("name")
+    extras = match.group("extras").split(",") if match.group("extras") else []
+    version_spec = match.group("version_spec") or ""
+    markers = match.group("markers") or ""
 
-def extract_min_version(package: str) -> str:
-    """
-    Extract the min version of a package from a requirements line.
-    ex: "pandas>=1.0.0,<2.0.0;python_version<'3.9'" -> "1.0.0"
-    """
-    # The max version is the defined version if it is a fixed version.
-    if "==" in package:
-        version = package.split("==")[1]
-        if ";" in version:
-            # Remove installation markers.
-            version = version.split(";")[0]
-        return version
+    min_version = ""
+    max_version = ""
 
-    return package.split(">=")[1].split(",")[0]
+    # Extract min and max versions
+    if version_spec:
+        version_parts = [part.strip() for part in version_spec.split(",")]
+        for part in version_parts:
+            if part.startswith(">="):
+                min_version = part[2:].strip()
+            elif part.startswith("=="):
+                min_version = max_version = part[2:].strip()
+            elif part.startswith("<="):
+                max_version = part[2:].strip()
+            elif part.startswith("<"):
+                max_version = part[1:].strip()
 
-
-def extract_max_version(package: str) -> str:
-    """
-    Extract the max version of a package from a requirements line.
-    Ex:
-        - pandas==1.0.0 -> 1.0.0
-        - pandas>=1.0.0,<=2.0.0 -> 2.0.0
-        - pandas==1.0.0;python_version<'3.9' -> 1.0.0
-        - pandas>=1.0.0,<2.0.0;python_version<'3.9' -> 2.0.0
-    """
-    # The max version is the defined version if it is a fixed version.
-    if "==" in package:
-        version = package.split("==")[1]
-        if ";" in version:
-            # Remove installation markers.
-            version = version.split(";")[0]
-        return version
-
-    version = None
-
-    if ",<=" in package:
-        version = package.split(",<=")[1]
-    else:
-        version = package.split(",<")[1]
-
-    if ";" in version:
-        # Remove installation markers.
-        version = version.split(";")[0]
-
-    return version
-
-
-def extract_name(package: str) -> str:
-    """
-    Extract the name of a package from a requirements line.
-    Ex:
-        - pandas==1.0.0 -> pandas
-        - pandas>=1.0.0,<2.0.0 -> pandas
-        - pandas==1.0.0;python_version<'3.9' -> pandas
-        - pandas>=1.0.0,<2.0.0;python_version<'3.9' -> pandas
-    """
-    if "==" in package:
-        return package.split("==")[0]
-
-    name = package.split(">=")[0]
-
-    # Remove optional dependencies.
-    # Ex: "pandas[sql]" -> "pandas"
-    if "[" in name:
-        name = name.split("[")[0]
-    return name
-
-
-def extract_extras_dependencies(package: str) -> List[str]:
-    """
-    Extract the extras dependencies of a package from a requirements line.
-    Ex:
-        - pymongo[srv]>=4.2.0,<=4.6.1 -> ["srv"]
-    """
-    if "[" not in package:
-        return []
-
-    return package.split("[")[1].split("]")[0].split(",")
+    return name, min_version, max_version, markers, extras
 
 
 def load_dependencies(requirements_filenames: List[str], enforce_format: bool) -> Dict[str, Package]:
     """
-    Load and concat dependencies from requirements files.
+    Load and concatenate dependencies from requirements files.
+
+    Args:
+        requirements_filenames (List[str]): List of requirements file paths.
+        enforce_format (bool): Whether to enforce package format.
+
+    Returns:
+        Dict[str, Package]: Dictionary of package name to Package instance.
     """
-    # Extracted dependencies from requirements files.
-    dependencies = {}
+    dependencies: Dict[str, Package] = {}
 
     for filename in requirements_filenames:
-        file_dependencies = Path(filename).read_text("UTF-8").split("\n")
+        try:
+            content = Path(filename).read_text(encoding="UTF-8")
+            package_lines = [line.strip() for line in content.splitlines() if line.strip() and not line.startswith("#")]
+        except IOError as e:
+            logger.error(f"Failed to read file '{filename}': {e}")
+            continue
 
-        for package_requirements in file_dependencies:
-            # Ignore empty lines.
-            if not package_requirements:
+        for package_line in package_lines:
+            if enforce_format:
+                if not re.search(r">=|<", package_line) and "taipy" not in package_line.lower():
+                    logger.error(f"Invalid package format: '{package_line}' in '{filename}'")
+                    raise ValueError(f"Invalid package format: '{package_line}' in '{filename}'")
+
+            try:
+                package = Package.from_requirements(package_line, filename)
+            except ValueError as e:
+                logger.error(e)
                 continue
 
-            # Ensure the package is correctly formatted with born min and max.
-            if enforce_format:
-                Package.check_format(package_requirements)
-
-            package = Package.from_requirements(package_requirements, filename)
-
-            # dependencies may be present multiple times in different files.
-            # In that case, do not load the releases again but ensure versions are the same.
             if package.name in dependencies:
                 existing_package = dependencies[package.name]
-                if (
-                    not existing_package.min_version == package.min_version
-                    or not existing_package.max_version == package.max_version
-                ):
-                    raise Exception(
-                        f"Inconsistent version of '{package.name}' between '{filename}' and {','.join(package.files)}."
+                if (existing_package.min_version != package.min_version or
+                        existing_package.max_version != package.max_version):
+                    logger.error(
+                        f"Inconsistent versions for package '{package.name}' between files: "
+                        f"{existing_package.files} and '{filename}'."
                     )
-
-                # Add the file as dependency of the package.
+                    raise ValueError(
+                        f"Inconsistent versions for package '{package.name}' between files: "
+                        f"{existing_package.files} and '{filename}'."
+                    )
                 existing_package.files.append(filename)
-                # Stop processing, package is already extracted.
-                continue
-
-            dependencies[package.name] = package
+            else:
+                dependencies[package.name] = package
 
     return dependencies
 
 
-def display_dependencies_versions(dependencies: Dict[str, Package]):
+def display_dependencies_versions(dependencies: Dict[str, Package]) -> None:
     """
-    Display dependencies information.
+    Display dependencies information in a tabulated format.
+
+    Args:
+        dependencies (Dict[str, Package]): Dictionary of package name to Package instance.
     """
     to_print = []
 
-    for package_name, package in dependencies.items():
-        if package.is_taipy:
-            continue
+    with requests.Session() as session:
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_package = {executor.submit(pkg.load_releases, session): pkg for pkg in dependencies.values() if not pkg.is_taipy}
+            for future in as_completed(future_to_package):
+                pkg = future_to_package[future]
+                if pkg.latest_release:
+                    to_print.append((
+                        pkg.name,
+                        f"{pkg.min_version} ({pkg.min_release.upload_date if pkg.min_release else 'N/A'})",
+                        f"{pkg.max_version} ({pkg.max_release.upload_date if pkg.max_release else 'N/A'})",
+                        f"{pkg.latest_release.version} ({pkg.latest_release.upload_date})",
+                        len([r for r in pkg.releases if r.version != pkg.max_version])
+                    ))
 
-        # Load the latest releases of the package.
-        package.load_releases()
-
-        to_print.append(
-            (
-                package_name,
-                f'{package.min_version} ({package.min_release.upload_date if package.min_release else "N.A."})',
-                f'{package.max_version} ({package.max_release.upload_date if package.max_release else "N.C."})',
-                f"{package.releases[0].version} ({package.releases[0].upload_date})",
-                len(list(itertools.takewhile(lambda x: x.version != package.max_version, package.releases))),  # noqa: B023
-            )
-        )
-
-    to_print.sort(key=lambda x: x[0])
-    h = ["name", "version-min", "version-max", "current-version", "nb-releases-behind"]
-    print(tabulate.tabulate(to_print, headers=h, tablefmt="pretty"))  # noqa: T201
+    to_print.sort(key=lambda x: x[0].lower())
+    headers = ["Name", "Min Version", "Max Version", "Latest Version", "Releases Behind"]
+    print(tabulate.tabulate(to_print, headers=headers, tablefmt="pretty"))
 
 
 def update_dependencies(
-    # Dependencies installed in the environment.
     dependencies_installed: Dict[str, Package],
-    # Dependencies set in requirements files.
     dependencies_set: Dict[str, Package],
-    # Requirements files to update.
     requirements_filenames: List[str],
-):
+) -> None:
     """
-    Display and updates dependencies.
-    """
-    to_print = []
+    Display and update dependencies based on installed versions.
 
-    for name, ds in dependencies_set.items():
-        if ds.is_taipy:
+    Args:
+        dependencies_installed (Dict[str, Package]): Installed dependencies.
+        dependencies_set (Dict[str, Package]): Dependencies defined in requirements files.
+        requirements_filenames (List[str]): List of requirements file paths to update.
+    """
+    to_update = []
+
+    for name, set_pkg in dependencies_set.items():
+        if set_pkg.is_taipy:
             continue
 
-        # Find the package in use.
-        di = dependencies_installed.get(name)
-        # Some package as 'gitignore-parser' becomes 'gitignore_parser' during the installation.
-        if not di:
-            di = dependencies_installed.get(name.replace("-", "_"))
+        installed_pkg = dependencies_installed.get(name) or dependencies_installed.get(name.replace("-", "_"))
+        if installed_pkg and installed_pkg.max_version != set_pkg.max_version:
+            to_update.append((name, installed_pkg.max_version, ", ".join(set_pkg.files)))
+            set_pkg.max_version = installed_pkg.max_version
 
-        if di:
-            if di.max_version != ds.max_version:
-                to_print.append((name, di.max_version, ",".join(f.split("/")[0] for f in ds.files)))
-                # Save the new dependency version.
-                ds.max_version = di.max_version
+    if not to_update:
+        logger.info("All dependencies are up to date.")
+        return
 
-    # Print the dependencies to update.
-    to_print.sort(key=lambda x: x[0])
-    print(tabulate.tabulate(to_print, headers=["name", "version", "files"], tablefmt="pretty"))  # noqa: T201
+    # Display dependencies to update
+    to_update.sort(key=lambda x: x[0].lower())
+    headers = ["Name", "New Version", "Files"]
+    print(tabulate.tabulate(to_update, headers=headers, tablefmt="pretty"))
 
-    # Update requirements files.
-    for fd in requirements_filenames:
-        requirements = "\n".join(
-            d.as_requirements_line() for d in sorted(dependencies_set.values(), key=lambda d: d.name) if fd in d.files
-        )
-        # Add a new line at the end of the file.
-        requirements += "\n"
-        Path(fd).write_text(requirements, "UTF-8")
+    # Update requirements files
+    for filename in requirements_filenames:
+        try:
+            content = Path(filename).read_text(encoding="UTF-8")
+            updated_lines = []
+            for line in content.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    updated_lines.append(line)
+                    continue
+
+                pkg_name = parse_requirements_line(line)[0].lower()
+                pkg = dependencies_set.get(pkg_name)
+                if pkg and filename in pkg.files:
+                    updated_lines.append(pkg.as_requirements_line())
+                else:
+                    updated_lines.append(line)
+            updated_content = "\n".join(updated_lines) + "\n"
+            Path(filename).write_text(updated_content, encoding="UTF-8")
+            logger.info(f"Updated '{filename}' with new dependency versions.")
+        except IOError as e:
+            logger.error(f"Failed to update file '{filename}': {e}")
 
 
-def generate_raw_requirements_txt(dependencies: Dict[str, Package]):
+def generate_raw_requirements_txt(dependencies: Dict[str, Package]) -> None:
     """
-    Print the dependencies as requirements lines without version.
+    Print the dependencies as requirements lines without version specifications.
+
+    Args:
+        dependencies (Dict[str, Package]): Dictionary of package name to Package instance.
     """
-    for package in dependencies.values():
+    for package in sorted(dependencies.values(), key=lambda p: p.name):
         if not package.is_taipy:
-            print(package.as_requirements_line(with_version=False))  # noqa: T201
+            print(package.as_requirements_line(with_version=False))
 
 
-def update_pipfile(pipfile: str, dependencies_version: Dict[str, Package]):
+def update_pipfile(pipfile_path: str, dependencies_version: Dict[str, Package]) -> None:
     """
-    Update in place dependencies version of a Pipfile.
-    Warning:
-      Dependencies are loaded from requirements files without extras or markers.
-      The Pipfile contains extras and markers information.
-    """
-    dependencies_str = ""
-    pipfile_obj = toml.load(pipfile)
+    Update the Pipfile in place with the specified dependency versions.
 
-    packages = pipfile_obj.pop("packages")
+    Args:
+        pipfile_path (str): Path to the Pipfile.
+        dependencies_version (Dict[str, Package]): Dependencies with updated versions.
+    """
+    try:
+        pipfile_obj = toml.load(pipfile_path)
+    except (IOError, toml.TomlDecodeError) as e:
+        logger.error(f"Failed to load Pipfile '{pipfile_path}': {e}")
+        return
+
+    packages = pipfile_obj.get("packages", {})
+    updated_packages = {}
+
     for name, dep in packages.items():
-        # Find the package in use.
-        rp = dependencies_version.get(name)
-        # Some package as 'gitignore-parser' becomes 'gitignore_parser' during the installation.
-        if not rp:
-            rp = dependencies_version.get(name.replace("-", "_"))
-            if rp:
-                # Change for the real name of the package.
-                rp.name = name
-
-        if not rp:
-            # Package not found. Can be due to python version.
-            # Ex: backports.zoneinfo
-            if isinstance(dep, dict):
-                new_dep = ""
-                # Format as a Pipfile line.
-                new_dep = f'version="{dep["version"]}"'
-                if dep.get("markers"):
-                    new_dep += f', markers="{dep["markers"]}"'
-                if dep.get("extras"):
-                    new_dep += f', extras={dep["extras"]}'
-                dep = f"{{{new_dep}}}"
-            dependencies_str += f'"{name}" = {dep}\n'
+        pkg = dependencies_version.get(name) or dependencies_version.get(name.replace("-", "_"))
+        if pkg:
+            pkg.name = name  # Ensure correct casing
+            updated_packages[name] = pkg.as_pipfile_line()
         else:
             if isinstance(dep, dict):
-                # Requirements does not have installation markers and extras.
-                rp.installation_markers = dep.get("markers", "")
-                rp.extras_dependencies = [dep.get("extras")[0]] if dep.get("extras") else []
-            dependencies_str += f"{rp.as_pipfile_line()}\n"
+                dep_str = toml.dumps({"": dep}).strip().replace('"', '\\"').replace('\n', ', ')
+                updated_packages[name] = f'{{version="{dep["version"]}", markers="{dep.get("markers", "")}", extras={dep.get("extras", [])}}}'
+            else:
+                updated_packages[name] = dep
 
+    # Write updated packages back to Pipfile
+    pipfile_obj["packages"] = {}
     toml_str = toml.dumps(pipfile_obj)
-    Path(pipfile).write_text(f"{toml_str}\n\n[packages]\n{dependencies_str}", "UTF-8")
+    with open(pipfile_path, "w", encoding="UTF-8") as f:
+        f.write(f"{toml_str}\n\n[packages]\n")
+        for line in updated_packages.values():
+            f.write(f"{line}\n")
+
+    logger.info(f"Pipfile '{pipfile_path}' has been updated successfully.")
+
+
+def fetch_installed_dependencies(requirements_filename: str) -> Dict[str, Package]:
+    """
+    Load dependencies from an installed environment's requirements file.
+
+    Args:
+        requirements_filename (str): Path to the installed requirements file.
+
+    Returns:
+        Dict[str, Package]: Dictionary of package name to Package instance.
+    """
+    return load_dependencies([requirements_filename], enforce_format=False)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Dependency management helper script."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
+
+    # ensure-same-version command
+    parser_ensure = subparsers.add_parser(
+        "ensure-same-version",
+        help="Ensure that the same version of each package is set across all requirements files."
+    )
+    parser_ensure.add_argument(
+        "-f", "--files", nargs='+', required=True, help="List of requirements files to check."
+    )
+
+    # dependencies-summary command
+    parser_summary = subparsers.add_parser(
+        "dependencies-summary",
+        help="Display a summary of dependencies that need to be updated."
+    )
+    parser_summary.add_argument(
+        "installed_requirements", help="Path to the installed requirements file."
+    )
+    parser_summary.add_argument(
+        "-f", "--files", nargs='+', required=True, help="List of requirements files to compare."
+    )
+
+    # generate-raw-requirements command
+    parser_generate_raw = subparsers.add_parser(
+        "generate-raw-requirements",
+        help="Generate a raw requirements.txt without version specifications."
+    )
+    parser_generate_raw.add_argument(
+        "-f", "--files", nargs='+', required=True, help="List of requirements files to process."
+    )
+
+    # generate-pipfile command
+    parser_generate_pipfile = subparsers.add_parser(
+        "generate-pipfile",
+        help="Generate or update a Pipfile based on requirements files."
+    )
+    parser_generate_pipfile.add_argument(
+        "pipfile", help="Path to the Pipfile to update."
+    )
+    parser_generate_pipfile.add_argument(
+        "requirements", help="Path to the requirements file to base the Pipfile on."
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "ensure-same-version":
+        logger.info("Ensuring the same version across all requirements files...")
+        dependencies = load_dependencies(args.files, enforce_format=True)
+        display_dependencies_versions(dependencies)
+
+    elif args.command == "dependencies-summary":
+        logger.info("Generating dependencies summary...")
+        dependencies_installed = fetch_installed_dependencies(args.installed_requirements)
+        dependencies_set = load_dependencies(args.files, enforce_format=False)
+        update_dependencies(dependencies_installed, dependencies_set, args.files)
+
+    elif args.command == "generate-raw-requirements":
+        logger.info("Generating raw requirements.txt without version specifications...")
+        dependencies = load_dependencies(args.files, enforce_format=False)
+        generate_raw_requirements_txt(dependencies)
+
+    elif args.command == "generate-pipfile":
+        logger.info("Updating Pipfile based on requirements file...")
+        dependencies_version = load_dependencies([args.requirements], enforce_format=False)
+        update_pipfile(args.pipfile, dependencies_version)
+
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "ensure-same-version":
-        # Load dependencies from requirements files.
-        # Verify that the same version is set for the same package across files.
-        _requirements_filenames = glob.glob("taipy*/*requirements.txt")
-        _dependencies = load_dependencies(_requirements_filenames, True)
-        display_dependencies_versions(_dependencies)
-    if sys.argv[1] == "dependencies-summary":
-        # Load and compare dependencies from requirements files.
-        # The first file is the reference to the other.
-        # Display the differences including new version available on Pypi.
-        _requirements_filenames = glob.glob("taipy*/*requirements.txt")
-        _dependencies_installed = load_dependencies([sys.argv[2]], False)
-        _dependencies_set = load_dependencies(_requirements_filenames, False)
-        update_dependencies(_dependencies_installed, _dependencies_set, _requirements_filenames)
-    if sys.argv[1] == "generate-raw-requirements":
-        # Load dependencies from requirements files.
-        # Print the dependencies as requirements lines without born.
-        _requirements_filenames = glob.glob("taipy*/*requirements.txt")
-        _dependencies = load_dependencies(_requirements_filenames, False)
-        generate_raw_requirements_txt(_dependencies)
-    if sys.argv[1] == "generate-pipfile":
-        # Generate a new Pipfile from requirements files using dependencies versions
-        # set in the requirement file.
-        _pipfile_path = sys.argv[2]
-        _dependencies_version = load_dependencies([sys.argv[3]], False)
-        update_pipfile(_pipfile_path, _dependencies_version)
+    main()
